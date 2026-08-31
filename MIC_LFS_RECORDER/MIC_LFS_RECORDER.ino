@@ -1,16 +1,16 @@
 /*
- * MIC_LFS_RECORDER — הקלטה לזיכרון LittleFS והשמעה
- * לוח : ESP32 WROOM 32D
+ * MIC_LFS_RECORDER — recording to LittleFS storage and playback
+ * Board : ESP32 WROOM 32D
  *
- *  INMP441 (מיקרופון)      ESP32
+ *  INMP441 (microphone)    ESP32
  *  SCK   → GPIO 26
  *  WS    → GPIO 25
  *  SD    → GPIO 34
  *  VDD   → 3.3V  |  GND → GND  |  L/R → GND
  *
- *  MAX98357A (רמקול)       ESP32
- *  BCLK  → GPIO 26  (משותף)
- *  LRC   → GPIO 25  (משותף)
+ *  MAX98357A (speaker)     ESP32
+ *  BCLK  → GPIO 26  (shared)
+ *  LRC   → GPIO 25  (shared)
  *  DIN   → GPIO 14
  *  SD_MODE → GPIO 21
  */
@@ -20,8 +20,11 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include "freertos/stream_buffer.h"
 
-// ─── פינים ───────────────────────────────────────────────────
+#include "html_page.h"
+
+// ─── Pins ────────────────────────────────────────────────────
 #define PIN_BCLK      26
 #define PIN_WS        25
 #define PIN_MIC_DATA  34
@@ -37,186 +40,39 @@
 const char* WIFI_SSID = "testing123";
 const char* WIFI_PASS = "blahblah";
 
-// ─── הגדרות הקלטה ────────────────────────────────────────────
-#define MAX_RECORDINGS   3         // מספר ההקלטות
-#define MAX_REC_SECONDS  60        // מגבלת זמן — LittleFS קטן בהרבה מכרטיס SD
-#define MIN_FREE_BYTES   4096      // עצור הקלטה כשנשאר פחות מזה פנוי
+// ─── Recording settings ──────────────────────────────────────
+#define MAX_RECORDINGS   3         // number of recordings
+#define MAX_REC_SECONDS  60        // time limit — LittleFS is much smaller than an SD card
+#define MIN_FREE_BYTES   4096      // stop recording once free space drops below this
 
-// ─── מצב מערכת ───────────────────────────────────────────────
+// ─── System state ────────────────────────────────────────────
 enum State { IDLE, RECORDING, PLAYING };
 volatile State  g_state    = IDLE;
-volatile int    g_slot     = 0;    // חריץ נוכחי (1-3)
+volatile int    g_slot     = 0;    // current slot (1-3)
 volatile int    g_micGain  = 2;
 volatile int    g_spkGain  = 4;
 char g_status[64]          = "מוכן";
 
-int32_t   iBuf[BUF_SAMPLES];
 int32_t   oBuf[BUF_SAMPLES];
 WebServer server(80);
 
-// ─── שמות קבצים ──────────────────────────────────────────────
+// ─── Timing buffer between I2S (real-time) and flash (variable-time) ───
+#define AUDIO_SB_BYTES     (32 * 1024)   // ~1s @16kHz/16-bit — absorbs flash delays
+StreamBufferHandle_t        g_audioSB      = nullptr;
+TaskHandle_t                g_audioTask    = nullptr;
+volatile bool                g_audioTaskRun  = false;
+volatile bool                g_audioTaskDone = false;
+volatile int32_t              g_recPeak       = 0;   // level meter for serial output
+
+// ─── File names ──────────────────────────────────────────────
 String recFile(int slot) { return "/rec" + String(slot) + ".raw"; }
 
 // ─── WAV header (16-bit PCM mono) ────────────────────────────
-// קבצים נשמרים כ-RAW 32-bit ונמירים ל-16-bit בעת השמעה
+// Files are stored as 32-bit RAW and converted to 16-bit during playback
 
-// ─── דף ווב ───────────────────────────────────────────────────
-static const char PAGE[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html lang="he" dir="rtl">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>מקליט קול</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:Arial,sans-serif;background:#0f0f1a;color:#eee;
-         display:flex;flex-direction:column;align-items:center;
-         justify-content:center;min-height:100vh;gap:20px;padding:20px}
-    h2{font-size:1.4em;letter-spacing:1px}
 
-    /* בחירת חריץ */
-    .slots{display:flex;gap:12px}
-    .slot{width:80px;height:80px;border-radius:12px;border:2px solid #444;
-          background:#1a1a2e;font-size:1.1em;font-weight:bold;cursor:pointer;
-          display:flex;flex-direction:column;align-items:center;
-          justify-content:center;gap:4px;transition:all 0.15s;color:#eee}
-    .slot.active{border-color:#00e676;background:#003320}
-    .slot.has-rec{border-color:#2196f3}
-    .slot .dot{width:10px;height:10px;border-radius:50%;background:#444}
-    .slot.has-rec .dot{background:#2196f3}
-    .slot.active .dot{background:#00e676}
 
-    /* כפתורי פעולה */
-    .actions{display:flex;gap:14px}
-    button{padding:12px 26px;border:none;border-radius:10px;font-size:1em;
-           font-weight:bold;cursor:pointer;transition:opacity 0.15s}
-    button:active{opacity:0.65}
-    button:disabled{opacity:0.3;cursor:default}
-    #btnRec  {background:#f44336;color:#fff}
-    #btnStop {background:#ff9800;color:#000}
-    #btnPlay {background:#00c853;color:#000}
-
-    /* מד עוצמה */
-    #meter{width:520px;background:#222;border-radius:10px;
-           height:44px;overflow:hidden;border:1px solid #333}
-    #bar{height:100%;width:0%;border-radius:10px;
-         background:linear-gradient(90deg,#00e676 0%,#ffeb3b 65%,#f44336 100%);
-         transition:width 0.1s ease}
-
-    /* סליידרים */
-    .sliders{display:flex;gap:40px}
-    .sl-box{display:flex;flex-direction:column;align-items:center;gap:8px}
-    .sl-box label{font-size:0.85em;color:#aaa}
-    .sl-box .val{font-size:1.6em;font-weight:bold;color:#00e676}
-    input[type=range]{-webkit-appearance:none;width:180px;height:7px;
-                      background:#333;border-radius:4px;outline:none}
-    input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;
-      width:22px;height:22px;border-radius:50%;background:#00e676;cursor:pointer}
-    #micSlider::-webkit-slider-thumb{background:#2196f3}
-
-    #status{font-size:0.85em;color:#777;min-height:1.2em;text-align:center}
-    .rec-dot{display:inline-block;width:10px;height:10px;border-radius:50%;
-             background:#f44336;margin-left:6px;animation:blink 0.7s infinite}
-    @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
-  </style>
-</head>
-<body>
-  <h2>🎙️ מקליט קול — LittleFS</h2>
-
-  <div class="slots">
-    <div class="slot active" id="slot1" onclick="selectSlot(1)">
-      <div class="dot"></div><span>הקלטה 1</span>
-    </div>
-    <div class="slot" id="slot2" onclick="selectSlot(2)">
-      <div class="dot"></div><span>הקלטה 2</span>
-    </div>
-    <div class="slot" id="slot3" onclick="selectSlot(3)">
-      <div class="dot"></div><span>הקלטה 3</span>
-    </div>
-  </div>
-
-  <div id="meter"><div id="bar"></div></div>
-
-  <div class="actions">
-    <button id="btnRec"  onclick="cmd('record')">⏺ הקלט</button>
-    <button id="btnStop" onclick="cmd('stop')" disabled>⏹ עצור</button>
-    <button id="btnPlay" onclick="cmd('play')">▶ השמע</button>
-  </div>
-
-  <div class="sliders">
-    <div class="sl-box">
-      <label>🎤 עוצמת מיקרופון</label>
-      <div class="val" id="micVal">2</div>
-      <input type="range" id="micSlider" min="1" max="10" value="2"
-             oninput="setGain('mic',this.value)">
-    </div>
-    <div class="sl-box">
-      <label>🔊 עוצמת השמעה</label>
-      <div class="val" id="spkVal">4</div>
-      <input type="range" id="spkSlider" min="1" max="10" value="4"
-             oninput="setGain('spk',this.value)">
-    </div>
-  </div>
-
-  <div id="status">מוכן</div>
-
-<script>
-let currentSlot = 1;
-let hasRec = [false, false, false];
-let updates = 0;
-
-function selectSlot(n) {
-  currentSlot = n;
-  document.querySelectorAll('.slot').forEach((el,i) => {
-    el.classList.toggle('active', i+1 === n);
-  });
-}
-
-async function cmd(action) {
-  await fetch('/cmd?a=' + action + '&slot=' + currentSlot);
-}
-
-async function setGain(who, val) {
-  document.getElementById(who + 'Val').textContent = val;
-  await fetch('/gain?who=' + who + '&v=' + val);
-}
-
-async function poll() {
-  try {
-    const d = await (await fetch('/data')).json();
-    document.getElementById('bar').style.width = d.level + '%';
-
-    // עדכון כפתורים
-    const rec  = d.state === 'recording';
-    const play = d.state === 'playing';
-    document.getElementById('btnRec').disabled  = rec || play;
-    document.getElementById('btnStop').disabled = !rec && !play;
-    document.getElementById('btnPlay').disabled = rec || play;
-
-    // עדכון חריצים — יש הקלטה?
-    d.slots.forEach((has, i) => {
-      document.getElementById('slot'+(i+1)).classList.toggle('has-rec', has);
-    });
-
-    // סטטוס
-    let st = d.status;
-    if (rec) st = '<span class="rec-dot"></span> ' + st;
-    document.getElementById('status').innerHTML = st;
-
-  } catch(e) {
-    document.getElementById('status').textContent = 'שגיאת חיבור';
-  }
-}
-
-setInterval(poll, 150);
-poll();
-</script>
-</body>
-</html>
-)HTML";
-
-// ─── I2S Full-Duplex ──────────────────────────────────────────
+// ─── I2S full-duplex setup ────────────────────────────────────
 void setupI2S() {
     i2s_config_t cfg = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
@@ -225,7 +81,7 @@ void setupI2S() {
         .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count        = 8,
+        .dma_buf_count        = 16,   // extra margin to absorb flash write delays
         .dma_buf_len          = 64,
         .use_apll             = false,
         .tx_desc_auto_clear   = true,
@@ -242,12 +98,12 @@ void setupI2S() {
     i2s_zero_dma_buffer(I2S_PORT);
 }
 
-// ─── בדיקה אם קיימת הקלטה בחריץ ─────────────────────────────
+// ─── Check whether a slot has a recording ────────────────────
 bool hasRecording(int slot) {
     return LittleFS.exists(recFile(slot).c_str());
 }
 
-// ─── נתבי HTTP ────────────────────────────────────────────────
+// ─── HTTP routes ──────────────────────────────────────────────
 void handleRoot() { server.send_P(200, "text/html", PAGE); }
 
 void handleData() {
@@ -296,7 +152,38 @@ void handleGain() {
     server.send(200, "text/plain", "ok");
 }
 
-// ─── הקלטה לקובץ ─────────────────────────────────────────────
+// ─── Dedicated task: reads I2S at a fixed rate, no flash access ───
+void i2sRecordTask(void *pv) {
+    static int32_t rawBuf[BUF_SAMPLES];
+    static int16_t s16Buf[BUF_SAMPLES];
+    size_t bytesRead;
+
+    while (g_audioTaskRun) {
+        i2s_read(I2S_PORT, rawBuf, sizeof(rawBuf), &bytesRead, pdMS_TO_TICKS(100));
+        int n = bytesRead / sizeof(int32_t);
+        if (n == 0) continue;
+
+        // store as 16-bit (saves space) — shift by 8 + apply mic gain
+        int micG = g_micGain;
+        int32_t peak = 0;
+        for (int i = 0; i < n; i++) {
+            int32_t s24 = rawBuf[i] >> 8;
+            int64_t amp = (int64_t)s24 * micG;
+            amp = constrain(amp, -8388607LL, 8388607LL);
+            s16Buf[i] = (int16_t)(amp >> 8);    // 24-bit → 16-bit
+            int32_t a = abs(s24);
+            if (a > peak) peak = a;
+        }
+        g_recPeak = peak;
+
+        // blocks until there's room in the buffer — so flash write delay doesn't drop samples
+        xStreamBufferSend(g_audioSB, s16Buf, n * 2, pdMS_TO_TICKS(500));
+    }
+    g_audioTaskDone = true;
+    vTaskDelete(NULL);
+}
+
+// ─── Recording to a file ──────────────────────────────────────
 void doRecord(int slot) {
     LittleFS.remove(recFile(slot).c_str());
     File f = LittleFS.open(recFile(slot).c_str(), FILE_WRITE);
@@ -306,13 +193,21 @@ void doRecord(int slot) {
         return;
     }
 
+    g_audioSB      = xStreamBufferCreate(AUDIO_SB_BYTES, 1);
+    g_audioTaskRun  = true;
+    g_audioTaskDone = false;
+    xTaskCreatePinnedToCore(i2sRecordTask, "i2sRec", 4096, NULL,
+                             configMAX_PRIORITIES - 2, &g_audioTask, 0);
+
     int recorded = 0;
-    size_t bytesRead;
+    uint8_t chunk[1024];
+    uint32_t lastPoll = 0;
 
     Serial.printf("[REC] חריץ %d — עד %ds\n", slot, MAX_REC_SECONDS);
 
     while (g_state == RECORDING) {
-        server.handleClient();
+        uint32_t now = millis();
+        if (now - lastPoll >= 20) { server.handleClient(); lastPoll = now; }
 
         if (recorded / SAMPLE_RATE >= MAX_REC_SECONDS) {
             snprintf(g_status, sizeof(g_status), "הגעת למגבלת הזמן (%ds)", MAX_REC_SECONDS);
@@ -323,36 +218,33 @@ void doRecord(int slot) {
             break;
         }
 
-        i2s_read(I2S_PORT, iBuf, sizeof(iBuf), &bytesRead, 100);
-        int n = bytesRead / sizeof(int32_t);
-
-        // שמור 16-bit (חיסכון במקום) — הסט ב-8 + הגברת מיקרופון
-        int micG = g_micGain;
-        bool writeFailed = false;
-        for (int i = 0; i < n; i++) {
-            int32_t s24 = iBuf[i] >> 8;
-            int64_t amp = (int64_t)s24 * micG;
-            amp = constrain(amp, -8388607LL, 8388607LL);
-            int16_t s16 = (int16_t)(amp >> 8);    // 24-bit → 16-bit
-            if (f.write((uint8_t*)&s16, 2) != 2) { writeFailed = true; break; }
-        }
-        recorded += n;
-        if (writeFailed) {
-            strlcpy(g_status, "האחסון מלא", sizeof(g_status));
-            break;
+        // drains the audio buffer and writes to flash — delay here no longer affects I2S
+        size_t got = xStreamBufferReceive(g_audioSB, chunk, sizeof(chunk), pdMS_TO_TICKS(50));
+        if (got > 0) {
+            if (f.write(chunk, got) != got) {
+                strlcpy(g_status, "האחסון מלא", sizeof(g_status));
+                break;
+            }
+            recorded += got / 2;
         }
 
-        // מד עוצמה בסריאל
-        int32_t peak = 0;
-        for (int i = 0; i < n; i++) {
-            int32_t a = abs(iBuf[i] >> 8);
-            if (a > peak) peak = a;
-        }
-        int lvl = constrain(map(peak, 0, 800000, 0, 40), 0, 40);
+        int lvl = constrain(map(g_recPeak, 0, 800000, 0, 40), 0, 40);
         Serial.printf("\r[REC] |");
         for (int i = 0; i < 40; i++) Serial.print(i < lvl ? "=" : " ");
         Serial.printf("| %ds", recorded / SAMPLE_RATE);
     }
+
+    // stop the I2S task and drain whatever remains in the buffer before closing the file
+    g_audioTaskRun = false;
+    uint32_t waitStart = millis();
+    while (!g_audioTaskDone && millis() - waitStart < 1000) delay(5);
+    size_t got;
+    while ((got = xStreamBufferReceive(g_audioSB, chunk, sizeof(chunk), 0)) > 0) {
+        f.write(chunk, got);
+        recorded += got / 2;
+    }
+    vStreamBufferDelete(g_audioSB);
+    g_audioSB = nullptr;
 
     f.close();
     Serial.printf("\n[REC] נשמר: %s (%d דגימות)\n",
@@ -361,7 +253,30 @@ void doRecord(int slot) {
     g_state  = IDLE;
 }
 
-// ─── השמעה מקובץ ─────────────────────────────────────────────
+// ─── Dedicated task: writes I2S at a fixed rate, no flash access ───
+void i2sPlayTask(void *pv) {
+    static int16_t s16buf[BUF_SAMPLES];
+    static int32_t outBuf[BUF_SAMPLES];
+    size_t written;
+
+    while (g_audioTaskRun) {
+        size_t got = xStreamBufferReceive(g_audioSB, s16buf, sizeof(s16buf), pdMS_TO_TICKS(100));
+        int n = got / 2;
+        if (n == 0) continue;
+
+        int spkG = g_spkGain;
+        for (int i = 0; i < n; i++) {
+            int64_t amp = (int64_t)s16buf[i] * spkG;
+            amp = constrain(amp, -32767LL, 32767LL);
+            outBuf[i] = (int32_t)((int16_t)amp) << 16;  // 16-bit → 32-bit frame
+        }
+        i2s_write(I2S_PORT, outBuf, n * sizeof(int32_t), &written, portMAX_DELAY);
+    }
+    g_audioTaskDone = true;
+    vTaskDelete(NULL);
+}
+
+// ─── Playback from a file ─────────────────────────────────────
 void doPlay(int slot) {
     File f = LittleFS.open(recFile(slot).c_str(), FILE_READ);
     if (!f) {
@@ -370,26 +285,41 @@ void doPlay(int slot) {
         return;
     }
 
-    int spkG = g_spkGain;
+    g_audioSB      = xStreamBufferCreate(AUDIO_SB_BYTES, 1);
+    g_audioTaskRun  = true;
+    g_audioTaskDone = false;
+    xTaskCreatePinnedToCore(i2sPlayTask, "i2sPlay", 4096, NULL,
+                             configMAX_PRIORITIES - 2, &g_audioTask, 0);
+
     size_t written;
-    int16_t s16buf[BUF_SAMPLES];
+    uint8_t chunk[1024];
+    uint32_t lastPoll = 0;
 
     Serial.printf("[PLAY] חריץ %d — %lu bytes\n", slot, f.size());
 
+    // pre-loads the buffer from flash — read delays no longer cause playback gaps
     while (g_state == PLAYING && f.available() >= 2) {
-        server.handleClient();
+        uint32_t now = millis();
+        if (now - lastPoll >= 20) { server.handleClient(); lastPoll = now; }
 
-        int n = f.read((uint8_t*)s16buf, BUF_SAMPLES * 2) / 2;
-        for (int i = 0; i < n; i++) {
-            int64_t amp = (int64_t)s16buf[i] * spkG;
-            amp = constrain(amp, -32767LL, 32767LL);
-            oBuf[i] = (int32_t)((int16_t)amp) << 16;  // 16-bit → 32-bit frame
-        }
-        i2s_write(I2S_PORT, oBuf, n * sizeof(int32_t), &written, portMAX_DELAY);
+        size_t toRead = min((size_t)sizeof(chunk), (size_t)f.available());
+        toRead -= toRead % 2;
+        if (toRead == 0) break;
+        int got = f.read(chunk, toRead);
+        xStreamBufferSend(g_audioSB, chunk, got, portMAX_DELAY);
     }
 
+    // wait until the task has played everything already loaded into the buffer
+    while (g_state == PLAYING && xStreamBufferBytesAvailable(g_audioSB) > 0) delay(10);
+
+    g_audioTaskRun = false;
+    uint32_t waitStart = millis();
+    while (!g_audioTaskDone && millis() - waitStart < 1000) delay(5);
+    vStreamBufferDelete(g_audioSB);
+    g_audioSB = nullptr;
+
     f.close();
-    // שתיקה קצרה בסוף
+    // brief silence at the end
     memset(oBuf, 0, sizeof(oBuf));
     i2s_write(I2S_PORT, oBuf, sizeof(oBuf), &written, portMAX_DELAY);
 
@@ -408,7 +338,7 @@ void setup() {
     pinMode(PIN_SD_MODE, OUTPUT);
     digitalWrite(PIN_SD_MODE, HIGH);
 
-    // LittleFS — true = פרמט אוטומטי אם ה-mount הראשון נכשל
+    // LittleFS — true = auto-format if the first mount fails
     if (!LittleFS.begin(true)) {
         Serial.println("  [!] LittleFS נכשל");
     } else {
