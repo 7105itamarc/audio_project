@@ -2,15 +2,11 @@ import socket
 from google import genai
 from google.genai import types
 
-API_KEY = "PLACE HOLDER FOR AI API KEY"
+API_KEY = "PLACE_HOLDER_FOR_AI_API_KEY"
 client = genai.Client(api_key=API_KEY)
 
 # Fast conversational text based model with memory
 chat = client.chats.create(model="gemini-3.5-flash-lite")
-
-# The Voice: Dedicated TTS model 
-tts_chat = client.chats.create(model="gemini-3.1-flash-tts-preview")
-
 
 HOST = "0.0.0.0"
 PORT = 5000
@@ -44,6 +40,9 @@ try:
                 print(f"[Gemini]: {text_response}")
 
                 print("[*] Generating Audio...")
+
+                # The Voice: Dedicated TTS model 
+                tts_chat = client.chats.create(model="gemini-3.1-flash-tts-preview")
                 
                 # Convert the text prompt response to speech
                 audio_stream = tts_chat.send_message_stream(
