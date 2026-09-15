@@ -1,13 +1,13 @@
 /****************************************************
  *  Project   : ESP32 AI Voice Assistant
  *  Board     : ESP32-S3 / ESP32-C3 / ESP32 CLASSIC
- *  Author    : OceanLabz
+ *  Author    : OceanLabz (Modified with Latency Optimizations)
  *  Version   : 1.0.0
  *  Date      : 2025-02-10
  *
  *  Description:
  *  --------------------------------------------------------
- *  - Records voice using INMP441 I2S microphone
+ *  - Records voice using INMP441 I2S microphone (Live HTTP Stream)
  *  - Converts speech to text using OpenAI Whisper
  *  - Sends text to ChatGPT for AI response
  *  - Converts AI response to speech using ElevenLabs / OpenAI
@@ -114,12 +114,12 @@
 
 // ==================== CONFIGURATION ====================
 // TODO: MOVE THESE TO secrets.h OR USE PREFERENCES/NVS
-const char* ssid     = "Solomon";
-const char* password = "0547648573";
+const char* ssid     = "hadas";
+const char* password = "0523760404";
 
 // TODO: REMOVE API KEYS FROM CODE - USE ENCRYPTED STORAGE
-const char* openaiApiKey = "OPEN_AI_KEY_PLACEHOLDER";
-const char* elevenLabsApiKey = "ELEVEN_LABS_API_KEY";
+const char* openaiApiKey = "OPEN_AI_KEY";
+const char* elevenLabsApiKey = "ELEVEN_API_KEY";
 
 // API URLs
 const char* openaiChatUrl = "https://api.openai.com/v1/chat/completions";
@@ -127,7 +127,7 @@ const char* openaiTtsUrl = "https://api.openai.com/v1/audio/speech";
 const char* openaiSttUrl = "https://api.openai.com/v1/audio/transcriptions";
 const char* elevenLabsTtsUrl = "https://api.elevenlabs.io/v1/text-to-speech/";
 
-const char* voiceId = "hpp4J3VqNfWAUOO0d1Us"; // voice id elevel labs - BELLA
+const char* voiceId = "hpp4J3VqNfWAUOO0d1Us"; // eleven labs voice id - BELLA
 
 // ==================== GLOBALS ====================
 AudioGeneratorMP3 *mp3 = nullptr;
@@ -139,6 +139,9 @@ i2s_pin_config_t i2s_mic_pins;
 
 bool gettingResponse = false;
 bool recordingMode = false;
+
+//time recorded before closure of recording video to the moment the response audio get played in the speaker
+unsigned long recordingEndTime = 0;
 
 /**
  * @brief Arduino setup function.
@@ -357,7 +360,6 @@ void playAudioFromSD() {
     return;
   }
   
-  // Forcefully release I2S_NUM_1 just in case the previous cleanup missed it
   static bool hasPlayedAudio = false;
   if (hasPlayedAudio) {
     i2s_driver_uninstall(I2S_NUM_1); 
@@ -374,6 +376,13 @@ void playAudioFromSD() {
     cleanupAudio();
     return;
   }
+
+  // PRINT LATENCY - FROM CLOSE OF RECORDING WINDOW TO SPEAKER PLAYBACK ---
+  float latencySeconds = (millis() - recordingEndTime) / 1000.0;
+  Serial.print("Audio about to play! Latency from recording end: ");
+  Serial.print(latencySeconds);
+  Serial.println(" seconds");
+  // ---------------------------------------------
   
   Serial.println("Playback started");
 }
@@ -404,158 +413,28 @@ void startRecordingAndTranscription() {
   Serial.println("\n----- Starting Recording -----");
   Serial.println("Please speak... (recording for " + String(RECORDING_DURATION) + " seconds)");
 
-  const char* filename = "/recording.wav";
-  
-  if (recordAudioToSD(filename)) {
-    Serial.println("Recording completed");
-    Serial.println("Converting speech to text...");
+  String transcribedText = streamRecordingAndTranscription();
 
-    String transcribedText = speechToTextHttpClient(filename);
-    
-    // Optional: Delete recording after processing
-    // SD.remove(filename);
-
-    if (transcribedText.length() > 0) {
-      Serial.println("\nRecognition result: " + transcribedText);
-      Serial.println("\nSending to ChatGPT...");
-      chatGptCall(transcribedText);
-    } else {
-      Serial.println("Failed to recognize text or an error occurred.");
-    }
+  if (transcribedText.length() > 0) {
+    Serial.println("\nRecognition result: " + transcribedText);
+    Serial.println("\nSending to ChatGPT...");
+    chatGptCall(transcribedText);
   } else {
-    Serial.println("Failed to record audio!");
+    Serial.println("Failed to recognize text or an error occurred.");
   }
 }
 
 /**
- * @brief Records audio from the INMP441 microphone to SD card.
- *
- * Captures I2S audio, converts it to 16-bit PCM WAV format,
- * applies basic noise gating, and stores the result on SD card.
- *
- * @param filename WAV file path on SD card
- * @return true if recording succeeds, false otherwise
+ * @brief Streams I2S audio directly to the OpenAI socket.
  */
-
-bool recordAudioToSD(const char* filename) {
-  if (i2s_driver_install(I2S_NUM_0, &i2s_mic_config, 0, NULL) != ESP_OK) {
-    Serial.println("Failed to install I2S driver");
-    return false;
-  }
+String streamRecordingAndTranscription() {
+  Serial.println("\n----- Preparing Live HTTP Stream -----");
   
-  if (i2s_set_pin(I2S_NUM_0, &i2s_mic_pins) != ESP_OK) {
-    Serial.println("Failed to set I2S pins");
-    i2s_driver_uninstall(I2S_NUM_0);
-    return false;
-  }
-  
-  delay(100);
-  
-  if (SD.exists(filename)) {
-    SD.remove(filename);
-  }
-  
-  File wavFile = SD.open(filename, FILE_WRITE);
-  if (!wavFile) {
-    Serial.println("Failed to create WAV file");
-    i2s_driver_uninstall(I2S_NUM_0);
-    return false;
-  }
-  
-  uint8_t wavHeader[44];
+  // Calculate Payload Mathematics
   uint32_t total_samples = SAMPLE_RATE * RECORDING_DURATION;
-  createWavHeader(wavHeader, SAMPLE_RATE, 16, 1, total_samples);
-  wavFile.write(wavHeader, 44);
-  
-  Serial.println("Recording... Speak now!");
-  
-  const size_t buffer_size = 128; // Increased for 16-bit stereo buffering
-  int16_t audio_buffer[buffer_size];
-  
-  uint32_t samples_written = 0;
-  unsigned long start_time = millis();
-  uint32_t expected_samples = total_samples;
-  
-  while (samples_written < expected_samples) {
-    size_t bytes_read = 0;
-    
-    esp_err_t result = i2s_read(I2S_NUM_0, 
-                               (char*)audio_buffer, 
-                               sizeof(audio_buffer), 
-                               &bytes_read, 
-                               100);
-    
-    if (result != ESP_OK && result != ESP_ERR_TIMEOUT) {
-      Serial.println("I2S read error");
-      break;
-    }
-    
-    size_t samples_read = bytes_read / sizeof(int16_t);
-    
-    // Process Left channel (skip Right channel)
-    for (size_t i = 0; i < samples_read && samples_written < expected_samples; i += 2) {
-      int16_t sample_16bit = audio_buffer[i];
-      
-      // Noise gate
-      if (abs(sample_16bit) < 200) {
-        sample_16bit = 0;
-      }
-      
-      wavFile.write((uint8_t*)&sample_16bit, sizeof(int16_t));
-      samples_written++;
-    }
-    
-    if (millis() - start_time > (RECORDING_DURATION * 1000 + 2000)) {
-      break;
-    }
-  }
-  
-  wavFile.flush();
-  
-  if (samples_written > 0) {
-    wavFile.seek(0);
-    updateWavHeader(wavHeader, samples_written);
-    wavFile.write(wavHeader, 44);
-  }
-  
-  wavFile.close();
-  i2s_driver_uninstall(I2S_NUM_0);
-  
-  Serial.printf("Recorded: %lu samples, File: %s\n", samples_written, filename);
-  return samples_written > 0;
-}
-
-/**
- * @brief Converts recorded speech to text using Whisper API.
- *
- * Uploads a WAV audio file via HTTPS multipart request
- * and parses the transcription response.
- *
- * @param filename Path to WAV file on SD card
- * @return Transcribed text (empty string on failure)
- */
-
-String speechToTextHttpClient(const char* filename) {
-  String response = "";
-  
-  File audioFile = SD.open(filename, FILE_READ);
-  if (!audioFile) {
-    Serial.println("Failed to open audio file");
-    return response;
-  }
-  
-  WiFiClientSecure wifiClient;
-  wifiClient.setInsecure();
-  
-  HttpClient client(wifiClient, "api.openai.com", 443);
-  client.setHttpResponseTimeout(120000);
+  uint32_t audio_bytes_target = total_samples * 2; // 16-bit mono = 2 bytes per sample
   
   String boundary = "----WebKitFormBoundary" + String(millis());
-  String contentType = "multipart/form-data; boundary=" + boundary;
-  
-  size_t fileSize = audioFile.size();
-  
-  // Calculate content length
   String bodyStart = "--" + boundary + "\r\n";
   bodyStart += "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n";
   bodyStart += "Content-Type: audio/wav\r\n\r\n";
@@ -565,64 +444,154 @@ String speechToTextHttpClient(const char* filename) {
   bodyEnd += "whisper-1\r\n";
   bodyEnd += "--" + boundary + "--\r\n";
   
-  size_t contentLength = bodyStart.length() + fileSize + bodyEnd.length();
+  size_t contentLength = bodyStart.length() + 44 + audio_bytes_target + bodyEnd.length();
   
-  Serial.printf("Sending HTTPS request, size: %d bytes\n", contentLength);
+  WiFiClientSecure client;
+  client.setInsecure();
   
-  client.beginRequest();
-  client.post("/v1/audio/transcriptions");
-  client.sendHeader("Authorization", "Bearer " + String(openaiApiKey));
-  client.sendHeader("Content-Type", contentType);
-  client.sendHeader("Content-Length", contentLength);
-  client.beginBody();
+  Serial.println("Connecting to api.openai.com...");
+  if (!client.connect("api.openai.com", 443)) {
+    Serial.println("Connection failed!");
+    return "";
+  }
   
+  // 1. Send HTTP POST Headers
+  client.println("POST /v1/audio/transcriptions HTTP/1.1");
+  client.println("Host: api.openai.com");
+  client.println("Authorization: Bearer " + String(openaiApiKey));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.println("Connection: close");
+  client.print("Content-Length: ");
+  client.println(contentLength);
+  client.println();
+  
+  // 2. Send Boundary and WAV Header
   client.print(bodyStart);
   
-  const size_t chunkSize = 512;
-  uint8_t buffer[chunkSize];
-  size_t totalSent = 0;
+  uint8_t wavHeader[44];
+  createWavHeader(wavHeader, SAMPLE_RATE, 16, 1, total_samples);
+  client.write(wavHeader, 44);
   
-  while (audioFile.available()) {
-    size_t bytesRead = audioFile.read(buffer, chunkSize);
-    if (bytesRead > 0) {
-      client.write(buffer, bytesRead);
-      totalSent += bytesRead;
+  // 3. Start I2S Hardware
+  if (i2s_driver_install(I2S_NUM_0, &i2s_mic_config, 0, NULL) != ESP_OK) {
+    Serial.println("Failed to install I2S driver");
+    client.stop();
+    return "";
+  }
+  i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
+  delay(100); 
+  
+  Serial.println("Recording and Streaming... Speak now!");
+  
+  uint32_t total_bytes_sent = 0;
+  const size_t buffer_size = 512; 
+  int16_t i2s_buffer[buffer_size / 2];
+  
+  unsigned long start_time = millis();
+  
+  // 4. The Live Audio Routing Loop
+  while (total_bytes_sent < audio_bytes_target) {
+    if (millis() - start_time > 8000) {
+      Serial.println("\nTimeout! Network congestion detected. Padding with zeroes.");
+      break; 
+    }
+    
+    size_t bytes_read = 0;
+    esp_err_t result = i2s_read(I2S_NUM_0, (char*)i2s_buffer, sizeof(i2s_buffer), &bytes_read, 100);
+    
+    if (result == ESP_OK && bytes_read > 0) {
+      size_t samples_read = bytes_read / sizeof(int16_t);
+      int16_t mono_buffer[128];
+      size_t mono_samples = 0;
       
-      if (totalSent % 10240 == 0) {
-        Serial.printf("Progress: %d/%d bytes (%.1f%%)\n", totalSent, fileSize, (totalSent * 100.0) / fileSize);
+      // Extract the active channel and apply the noise gate
+      for (size_t i = 0; i < samples_read; i += 2) {
+        int16_t sample = i2s_buffer[i];
+        if (abs(sample) < 200) sample = 0; 
+        mono_buffer[mono_samples++] = sample;
       }
+      
+      size_t bytes_to_send = mono_samples * sizeof(int16_t);
+      
+      // Prevent over-sending at the very end of the loop
+      if (total_bytes_sent + bytes_to_send > audio_bytes_target) {
+        bytes_to_send = audio_bytes_target - total_bytes_sent;
+      }
+      
+      client.write((uint8_t*)mono_buffer, bytes_to_send);
+      total_bytes_sent += bytes_to_send;
+    }
+  }
+  
+  // 5. Zero-Padding Failsafe
+  if (total_bytes_sent < audio_bytes_target) {
+    uint8_t zero_pad[128] = {0}; 
+    while (total_bytes_sent < audio_bytes_target) {
+      size_t to_send = min((size_t)(audio_bytes_target - total_bytes_sent), sizeof(zero_pad));
+      client.write(zero_pad, to_send);
+      total_bytes_sent += to_send;
+    }
+  }
+  
+  i2s_driver_uninstall(I2S_NUM_0); 
+
+  // TIMER START - RECORDING WINDOW CLOSED ---
+  recordingEndTime = millis();
+  Serial.println("Recording window closed!");
+  // -------------------------------------
+  
+  // 6. Send the Suffix Boundary and flush
+  client.print(bodyEnd);
+  client.flush();
+  
+  Serial.println("Upload complete, awaiting transcription...");
+  
+  // 7. Parse the HTTP Response Safely
+  unsigned long respTimeout = millis() + 15000;
+  while (!client.available() && client.connected() && millis() < respTimeout) {
+    delay(10);
+  }
+  
+  if (!client.available()) {
+    Serial.println("Error: Response timed out waiting for OpenAI");
+    client.stop();
+    return "";
+  }
+  
+  // Skip HTTP headers
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0) {
+      break; 
+    }
+  }
+  
+  // Read JSON body
+  String responseBody = "";
+  respTimeout = millis() + 4000;
+  while ((client.connected() || client.available()) && millis() < respTimeout) {
+    while (client.available()) {
+      char c = (char)client.read();
+      responseBody += c;
+      respTimeout = millis() + 2000; 
     }
     delay(2);
   }
+  client.stop();
   
-  client.print(bodyEnd);
-  client.endRequest();
+  // Extract Transcript
+  String transcription = "";
+  DynamicJsonDocument doc(2048);
+  DeserializationError error = deserializeJson(doc, responseBody);
   
-  Serial.println("Request sent, waiting for response...");
-  
-  int httpCode = client.responseStatusCode();
-  String httpResponse = client.responseBody();
-  
-  Serial.print("HTTP Code: ");
-  Serial.println(httpCode);
-  
-  if (httpCode == 200) {
-    DynamicJsonDocument doc(2048);
-    DeserializationError error = deserializeJson(doc, httpResponse);
-    
-    if (!error && doc.containsKey("text")) {
-      response = doc["text"].as<String>();
-      Serial.println("Transcription: " + response);
-    } else {
-      Serial.println("JSON parsing failed");
-    }
+  if (!error && doc.containsKey("text")) {
+    transcription = doc["text"].as<String>();
   } else {
-    Serial.print("Error response: ");
-    Serial.println(httpResponse);
+    Serial.println("JSON Error or server error response:");
+    Serial.println(responseBody);
   }
   
-  audioFile.close();
-  return response;
+  return transcription;
 }
 
 /**
@@ -784,30 +753,6 @@ void createWavHeader(uint8_t* header, uint32_t sampleRate, uint16_t bitDepth, ui
   // data chunk
   header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
   uint32_t dataSize = numSamples * channels * (bitDepth / 8);
-  header[40] = dataSize & 0xFF;
-  header[41] = (dataSize >> 8) & 0xFF;
-  header[42] = (dataSize >> 16) & 0xFF;
-  header[43] = (dataSize >> 24) & 0xFF;
-}
-
-/**
- * @brief Updates WAV header after recording completes.
- *
- * Fixes file size and data chunk size fields
- * based on actual recorded samples.
- *
- * @param header WAV header buffer
- * @param actual_samples Number of recorded samples
- */
-
-void updateWavHeader(uint8_t* header, uint32_t actual_samples) {
-  uint32_t fileSize = actual_samples * 2 + 36;
-  header[4] = fileSize & 0xFF;
-  header[5] = (fileSize >> 8) & 0xFF;
-  header[6] = (fileSize >> 16) & 0xFF;
-  header[7] = (fileSize >> 24) & 0xFF;
-  
-  uint32_t dataSize = actual_samples * 2;
   header[40] = dataSize & 0xFF;
   header[41] = (dataSize >> 8) & 0xFF;
   header[42] = (dataSize >> 16) & 0xFF;
