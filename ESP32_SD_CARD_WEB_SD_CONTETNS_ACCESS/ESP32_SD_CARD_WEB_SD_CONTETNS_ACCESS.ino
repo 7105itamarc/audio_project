@@ -11,8 +11,8 @@
 #define SD_MOSI     23
 
 // ----- WiFi Credentials -----
-const char* ssid = "Solomon";
-const char* password = "0547648573";
+const char* ssid = "testing123";
+const char* password = "blahblah";
 
 // Initialize WebServer on port 80
 WebServer server(80);

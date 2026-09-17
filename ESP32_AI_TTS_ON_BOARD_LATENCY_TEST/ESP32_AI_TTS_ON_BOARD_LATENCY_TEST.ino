@@ -114,8 +114,8 @@
 
 // ==================== CONFIGURATION ====================
 // TODO: MOVE THESE TO secrets.h OR USE PREFERENCES/NVS
-const char* ssid     = "hadas";
-const char* password = "0523760404";
+const char* ssid     = "testing123";
+const char* password = "blahblah";
 
 // TODO: REMOVE API KEYS FROM CODE - USE ENCRYPTED STORAGE
 const char* openaiApiKey = "OPEN_AI_KEY";
@@ -128,6 +128,15 @@ const char* openaiSttUrl = "https://api.openai.com/v1/audio/transcriptions";
 const char* elevenLabsTtsUrl = "https://api.elevenlabs.io/v1/text-to-speech/";
 
 const char* voiceId = "hpp4J3VqNfWAUOO0d1Us"; // eleven labs voice id - BELLA
+
+// System Prompt - defines the behaviour and manner of the textual AI responses
+const char* SYSTEM_PROMPT = 
+  "You are a helpful voice assistant. You must strictly answer in English only, "
+  "regardless of the language used in the prompt. Keep your answers brief, "
+  "conversational, and strictly under 15 words. Do not use any markdown formatting, "
+  "bullet points, emojis, or special characters, as your response will be read "
+  "aloud by a text-to-speech engine.";
+
 
 // ==================== GLOBALS ====================
 AudioGeneratorMP3 *mp3 = nullptr;
@@ -442,6 +451,13 @@ String streamRecordingAndTranscription() {
   String bodyEnd = "\r\n--" + boundary + "\r\n";
   bodyEnd += "Content-Disposition: form-data; name=\"model\"\r\n\r\n";
   bodyEnd += "whisper-1\r\n";
+
+  // FORCE THE STT recognition to be strictly in ENGLISH
+  bodyEnd += "--" + boundary + "\r\n";
+  bodyEnd += "Content-Disposition: form-data; name=\"language\"\r\n\r\n";
+  bodyEnd += "en\r\n";
+  // ---------END OF LANGUAGE CONFIG-----------
+
   bodyEnd += "--" + boundary + "--\r\n";
   
   size_t contentLength = bodyStart.length() + 44 + audio_bytes_target + bodyEnd.length();
@@ -667,13 +683,13 @@ String sendMessage(String message) {
 
 String buildChatGptPayload(String message) {
   DynamicJsonDocument doc(768);
-  doc["model"] = "gpt-4.1-nano";  // Note: This model might not exist
+  doc["model"] = "gpt-4.1-nano";  // Keeping your original model name
   
   JsonArray messages = doc.createNestedArray("messages");
   
   JsonObject sysMsg = messages.createNestedObject();
   sysMsg["role"] = "system";
-  sysMsg["content"] = "Please answer questions briefly, responses should not exceed 30 words.";
+  sysMsg["content"] = SYSTEM_PROMPT; // <-- Insert the global variable here
 
   JsonObject userMsg = messages.createNestedObject();
   userMsg["role"] = "user";

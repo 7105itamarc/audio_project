@@ -114,8 +114,8 @@
 
 // ==================== CONFIGURATION ====================
 // TODO: MOVE THESE TO secrets.h OR USE PREFERENCES/NVS
-const char* ssid     = "Solomon";
-const char* password = "0547648573";
+const char* ssid     = "testing123";
+const char* password = "blahblah";
 
 // TODO: REMOVE API KEYS FROM CODE - USE ENCRYPTED STORAGE
 const char* openaiApiKey = "OPEN_AI_KEY_PLACEHOLDER";
